@@ -1,4 +1,9 @@
 data/
 .zed/
 
-.itch_state
+.DS_Store/
+*.dSYM/
+
+itch_stats
+test_order_table
+test_stock_book

@@ -29,18 +29,12 @@ const uint16_t ITCH_MSG_LEN[256] = {
     ['O'] = 48, /* Direct Listing with Capital Raise */
 };
 
-/* Worked example: offsets 0 type, 1 locate, 3 tracking, 5 timestamp. */
 void itch_decode_header(const uint8_t *p, itch_header *out) {
     out->type            = (char)p[0];
     out->stock_locate    = be16(p + 1);
     out->tracking_number = be16(p + 3);
     out->timestamp_ns    = be48(p + 5);
 }
-
-/* ---- TODO (milestone 1): implement the decoders below ------------------
- * Work out each field's byte offset from the spec. The body always starts
- * at offset 11, after the common header. Write a unit test for each one
- * in tests/test_decode.c BEFORE running it on the real file. */
 
 void itch_decode_add_order(const uint8_t *p, itch_add_order *out) {
     itch_decode_header(p, &out->hdr);
@@ -79,4 +73,10 @@ void itch_decode_order_replace(const uint8_t *p, itch_order_replace *out) {
     out->new_order_ref = be64(p + 19);
     out->shares = be32(p + 27);
     out->price = be32(p + 31);
+}
+
+void itch_decode_stock_directory(const uint8_t *p, itch_stock_directory *out)
+{
+    itch_decode_header(p, &out->hdr);
+    memcpy(out->stock, p + 11, 8);
 }

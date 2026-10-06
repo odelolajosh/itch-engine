@@ -73,6 +73,11 @@ typedef struct {                /* 'U' (35 bytes) */
     uint32_t price;
 } itch_order_replace;
 
+typedef struct {
+    itch_header hdr;
+    char stock[8];
+} itch_stock_directory;
+
 /* ---- Decoders ----------------------------------------------------------
  * `p` points at the message type byte (just after the length prefix).
  * Caller guarantees the buffer holds at least ITCH_MSG_LEN[type] bytes. */
@@ -82,5 +87,6 @@ void itch_decode_order_executed(const uint8_t *p, itch_order_executed *out);
 void itch_decode_order_cancel(const uint8_t *p, itch_order_cancel *out);
 void itch_decode_order_delete(const uint8_t *p, itch_order_delete *out);
 void itch_decode_order_replace(const uint8_t *p, itch_order_replace *out);
+void itch_decode_stock_directory(const uint8_t *p, itch_stock_directory *out);
 
 #endif /* ITCH_H */
