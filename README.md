@@ -2,8 +2,6 @@
 
 A high-performance Nasdaq TotalView-ITCH 5.0 feed handler and limit order book in C.
 
-> Status: Milestone 1 (parser) in progress.
-
 ## Getting the data
 
 Nasdaq publishes free sample ITCH 5.0 files (search "Nasdaq ITCH sample files").
