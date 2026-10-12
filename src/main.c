@@ -161,7 +161,9 @@ int main(int argc, char **argv) {
         uint16_t len = be16(data + off);
         if (len == 0 || off + 2 + len > limit)
         {
-            fprintf(stderr, "truncated or corrupt frame at offset %zu\n", off);
+            if (limit == file_size)
+                fprintf(stderr, "truncated or corrupt frame at offset %llu\n",
+                    (unsigned long long)off);
             break;
         }
         const uint8_t *msg = data + off + 2;
