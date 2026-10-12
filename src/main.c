@@ -86,39 +86,80 @@ static int add_order(engine_t *engine, uint16_t stock_locate,
     uint64_t order_ref, char side, uint32_t price, uint32_t shares);
 
 static size_t print_report(const engine_t *e, const char *path,
-                           size_t size, double elapsed);
+                           size_t off, size_t limit, size_t file_size, double elapsed);
+
+static uint64_t parse_size(const char *s);
+
+static void usage(const char *prog)
+{
+    fprintf(stderr, "usage: %s [--max-bytes N[K|M|G]] <itch_file>\n", prog);
+}
 
 int main(int argc, char **argv) {
-    if (argc != 2)
+    uint64_t max_bytes = UINT64_MAX; /* default: whole file */
+    const char *path = NULL;
+
+    for (int i = 1; i < argc; i++)
     {
-        fprintf(stderr, "usage: %s <itch_file>\n", argv[0]);
-        return 2;
+        if (strcmp(argv[i], "--max-bytes") == 0 && i + 1 < argc)
+        {
+            max_bytes = parse_size(argv[++i]);
+            if (max_bytes == 0)
+            {
+                fprintf(stderr, "bad --max-bytes value\n");
+                return 1;
+            }
+        }
+        else if (argv[i][0] == '-')
+        {
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            usage(argv[0]);
+            return 2;
+        }
+        else if (path == NULL)
+        {
+            path = argv[i];
+        }
+        else
+        {
+            fprintf(stderr, "unexpected argument: %s\n", argv[i]);
+            usage(argv[0]);
+            return 2;
+        }
+    }
+
+    if (!path)
+    {
+        usage(argv[0]);
+        return 1;
     }
 
     int status = EXIT_SUCCESS;
 
-    int fd = open(argv[1], O_RDONLY);
+    int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open"); return 1; }
 
     struct stat st;
     if (fstat(fd, &st) < 0) { perror("fstat"); return 1; }
 
-    size_t size = (size_t)st.st_size;
-    if (size == 0) { fprintf(stderr, "empty file\n"); return 1; }
+    size_t file_size = (size_t)st.st_size;
+    if (file_size == 0) { fprintf(stderr, "empty file\n"); return 1; }
 
-    const uint8_t *data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    size_t limit = (max_bytes < file_size) ? max_bytes : file_size;
+
+    const uint8_t *data = mmap(NULL, limit, PROT_READ, MAP_PRIVATE, fd, 0);
     if (data == MAP_FAILED) { perror("mmap"); return 1; }
-    posix_madvise((void *)data, size, POSIX_MADV_SEQUENTIAL); /* hint: linear scan */
+    posix_madvise((void *)data, limit, POSIX_MADV_SEQUENTIAL); /* hint: linear scan */
 
     engine_t engine;
-    if (!engine_init(&engine)) { munmap((void *)data, size); close(fd); return 1; }
+    if (!engine_init(&engine)) { munmap((void *)data, limit); close(fd); return 1; }
 
     double t0 = now_sec();
     size_t off = 0;
-    while (off + 2 <= size)
+    while (off + 2 <= limit)
     {
         uint16_t len = be16(data + off);
-        if (len == 0 || off + 2 + len > size)
+        if (len == 0 || off + 2 + len > limit)
         {
             fprintf(stderr, "truncated or corrupt frame at offset %zu\n", off);
             break;
@@ -265,12 +306,12 @@ int main(int argc, char **argv) {
 
     double elapsed = now_sec() - t0;
 
-    if (print_report(&engine, argv[1], size, elapsed) > 0)
+    if (print_report(&engine, argv[1], off, limit, file_size, elapsed) > 0)
         status = EXIT_FAILURE;
 
     cleanup:
         engine_free(&engine);
-        munmap((void *)data, size);
+        munmap((void *)data, file_size);
         close(fd);
         return status;
 }
@@ -368,10 +409,13 @@ static const char *msg_name(int t)
 }
 
 static size_t print_report(const engine_t *e, const char *path,
-                           size_t size, double elapsed)
+                           size_t off, size_t limit, size_t file_size, double elapsed)
 {
     printf("\n== Run ==\n");
-    printf("  %-22s %s (%.2f GB)\n", "file", path, (double)size / 1e9);
+    printf("  %-22s %s (%.2f GB)\n", "file", path, (double)file_size / 1e9);
+    printf("  bytes processed        %.2f GB of %.2f GB%s\n",
+           off / 1e9, file_size / 1e9,
+           limit < file_size ? " (capped by --max-bytes)" : "");
     printf("  %-22s %llu\n", "messages", U64(e->total));
     printf("  %-22s %.3f s\n", "elapsed", elapsed);
     if (elapsed > 0 && e->total > 0) {
@@ -434,4 +478,17 @@ static size_t print_report(const engine_t *e, const char *path,
     printf("  %-22s %llu\n", "orders >= $10,000", U64(e->high_price));
 
     return failed;
+}
+
+/* "4G" -> 4294967296, "500M" -> 524288000, "1000" -> 1000. Returns 0 on error. */
+static uint64_t parse_size(const char *s)
+{
+    char *end;
+    uint64_t n = strtoull(s, &end, 10);
+    switch (*end) {
+    case 'G': case 'g': n <<= 30; end++; break;
+    case 'M': case 'm': n <<= 20; end++; break;
+    case 'K': case 'k': n <<= 10; end++; break;
+    }
+    return (*end == '\0') ? n : 0;
 }
