@@ -116,3 +116,73 @@ Adding the order book made processing ~12× slower per message. The order table
 likely go to main memory (~100 ns each). Since ~86% of messages are a hash insert
 or delete, this is consistent with the ~74 ns average. Milestone 3 will test this
 with a profiler.
+
+## M3: Performance
+
+### Hybrid price-level search
+
+**Why:** profiling (`perf record`, 4 GiB slice) showed `level_find`, the search for a
+price level within one side of a book, at **32% of runtime**, almost as much as the
+order-table lookup (38%). Levels are stored best-price-last and were searched linearly
+from the end, on the assumption that activity concentrates near the best price.
+
+**Change:** scan the best 8 levels linearly (the common case), then binary search the rest.
+Both versions return the same position and found flag for every input
+(differential test against the old linear search in `tests/test_stock_book.c`).
+
+**Search statistics** (`make stats`, 150.3M searches; *depth* = levels from the best
+price to the target, *work* = levels actually compared; percentiles are bucket upper bounds):
+
+|                 | Depth | Work (hybrid) |
+| --------------- | ----: | ------------: |
+| Average steps   | 11.54 | **4.85**      |
+| p50 steps ≤     | 3     | 3             |
+| p90 steps ≤     | 31    | 15            |
+| p99 steps ≤     | 255   | **31**        |
+| p99.9 steps ≤   | 1023  | **31**        |
+
+Before this change, work equalled depth: the linear search compared every level it passed.
+
+| Steps     | Depth: searches |    % | cum % | Work: searches |    % | cum % |
+| --------- | --------------: | ---: | ----: | -------------: | ---: | ----: |
+| 0         |       9,010,880 |  6.0 |   6.0 |         90,927 |  0.1 |   0.1 |
+| 1         |      59,079,921 | 39.3 |  45.3 |     65,976,805 | 43.9 |  43.9 |
+| 2–3       |      26,866,213 | 17.9 |  63.2 |     28,010,181 | 18.6 |  62.6 |
+| 4–7       |      20,444,028 | 13.6 |  76.8 |     20,824,502 | 13.9 |  76.4 |
+| 8–15      |      17,501,264 | 11.6 |  88.4 |     27,737,764 | 18.5 |  94.9 |
+| 16–31     |       8,213,194 |  5.5 |  93.9 |      7,687,794 |  5.1 | 100.0 |
+| 32–63     |       5,046,371 |  3.4 |  97.2 |              0 |  0.0 | 100.0 |
+| 64–127    |       2,187,032 |  1.5 |  98.7 |              0 |  0.0 | 100.0 |
+| 128–255   |       1,051,689 |  0.7 |  99.4 |              0 |  0.0 | 100.0 |
+| 256–511   |         511,125 |  0.3 |  99.7 |              0 |  0.0 | 100.0 |
+| 512–1023  |         355,022 |  0.2 | 100.0 |              0 |  0.0 | 100.0 |
+| 1024–2047 |          47,652 |  0.0 | 100.0 |              0 |  0.0 | 100.0 |
+| 2048–4095 |          13,582 |  0.0 | 100.0 |              0 |  0.0 | 100.0 |
+
+Each column counts searches independently: a search 1,000 levels deep falls in depth row
+512–1023 but work row 16–31 (8 linear + ~11 binary-search comparisons). About 3% of searches
+(64+ levels deep) accounted for roughly half of all levels walked by the old linear search.
+
+Searches 8–15 levels deep now cost *more* comparisons than before (always 8 linear, then a
+binary search over the whole remaining side), which is why the work 8–15 bucket is larger
+than the depth one.
+
+**Timing** (A/B in one session, alternating runs, `perf stat -r 5`, CPU time):
+
+| Variant                     | task-clock       | vs. linear |
+| --------------------------- | ---------------- | ---------: |
+| Linear (original)           | 11.07 s ± 0.18%  | —          |
+| Hybrid, 8-level probe       | 10.87 s ± 0.19%  | −1.9%      |
+| Hybrid, 16-level probe      | 10.84 s ± 0.16%  | −2.1%      |
+| Hybrid, 32-level probe      | 10.87 s ± 1.12%  | −1.8%      |
+| Linear (repeat)             | 11.13 s ± 0.41%  | —          |
+| Hybrid, 8-level probe (repeat) | 10.97 s ± 0.23% | −1.4%     |
+
+Probe lengths 8–32 performed the same within noise; 8 was kept.
+
+**Finding:** 58% fewer comparisons gave only ~2% more throughput. Each linear step was cheap
+(~0.2 ns: sequential reads that the hardware prefetcher handles well, with predictable
+branches). The remaining ~20 ns per search goes to waiting for the level array itself to arrive
+from main memory, which points to prefetching as the next optimization. The hybrid also caps
+worst-case search work at ≤31 comparisons instead of thousands, which matters for tail latency
+even though average throughput barely moves.
