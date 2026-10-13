@@ -25,7 +25,13 @@ static double now_sec(void)
 }
 
 #ifndef PF_DIST
-#define PF_DIST 8          /* power of two: how many messages are queued ahead */
+/** How many messages are queued ahead. Must be a power of two */
+#define PF_DIST 8
+#endif
+
+#ifndef PF2_BACK
+/** How many messages before levels are prefetched (See `prefetch_m_stage2`). Must be less than PF_DIST - 1 */
+#define PF2_BACK 4
 #endif
 
 #define MAX_LOCATE (1 << 16)
@@ -59,7 +65,8 @@ typedef struct {
 } pending_message;
 
 static int next_message(const uint8_t *base, size_t limit, size_t file_size, size_t *off, pending_message *out);
-static void prefetch_message(engine_t *e, const uint8_t *msg);
+static void prefetch_m_stage1(engine_t *e, const uint8_t *msg);
+static void prefetch_m_stage2(engine_t *e, const uint8_t *msg);
 static int handle_message(engine_t *e, pending_message p);
 
 static void reduce_order(engine_t *engine, uint64_t order_ref, uint32_t shares, int delete_all);
@@ -143,8 +150,11 @@ int main(int argc, char **argv) {
 
     while (next_message(data, limit, file_size, &off, &p))
     {
-        prefetch_message(&engine, p.msg);
+        prefetch_m_stage1(&engine, p.msg);
         ring[head++ & (PF_DIST - 1)] = p;
+
+        if (head - tail > PF2_BACK)
+            prefetch_m_stage2(&engine, ring[(head - 1 - PF2_BACK) & (PF_DIST - 1)].msg);
 
         if (head - tail == PF_DIST) /* queue full: process the oldest */
         {
@@ -229,9 +239,10 @@ static int next_message(const uint8_t *base, size_t limit, size_t file_size, siz
     return 1;
 }
 
-static void prefetch_message(engine_t *e, const uint8_t *msg)
+static void prefetch_m_stage1(engine_t *e, const uint8_t *msg)
 {
-    switch (msg[0])
+    uint8_t type = msg[0];
+    switch (type)
     {
         case 'A':
         case 'F':
@@ -246,11 +257,43 @@ static void prefetch_message(engine_t *e, const uint8_t *msg)
             __builtin_prefetch(&e->books[locate], 1, 3);
             order_table_prefetch(&e->orders, ref);
 
-            if (msg[0] == 'U')
+            if (type == 'U')
             {
                 uint64_t new_ref = be64(msg + 19);
                 order_table_prefetch(&e->orders, new_ref);
             }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+static inline void prefetch_level_end(const book *b, char side)
+{
+    const level_array *la = (side == 'B') ? &b->bids : &b->asks;
+    if (la->data && la->len)
+        __builtin_prefetch(&la->data[la->len - 1], 1, 3);
+}
+
+static void prefetch_m_stage2(engine_t *e, const uint8_t *msg)
+{
+    uint8_t type = msg[0];
+    switch (type)
+    {
+        case 'A':
+        case 'F':
+            prefetch_level_end(&e->books[be16(msg + 1)], (char) msg[19]);
+            break;
+        case 'D':
+        case 'E':
+        case 'C':
+        case 'X':
+        case 'U':
+        {
+            const order *o = order_table_find(&e->orders, be64(msg + 11));
+            if (o)
+                prefetch_level_end(&e->books[o->stock_locate], o->side);
             break;
         }
         default:
