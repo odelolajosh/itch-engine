@@ -25,7 +25,7 @@ static double now_sec(void)
 }
 
 #ifndef PF_DIST
-#define PF_DIST 16          /* power of two: how many messages are queued ahead */
+#define PF_DIST 8          /* power of two: how many messages are queued ahead */
 #endif
 
 #define MAX_LOCATE (1 << 16)
