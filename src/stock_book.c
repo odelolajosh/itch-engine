@@ -40,7 +40,9 @@ int level_array_grow(level_array *la)
     return 1;
 }
 
-#define LINEAR_PROBE 8   /* from the histogram: ~77% of searches end within 7 steps */
+#ifndef LINEAR_PROBE
+#define LINEAR_PROBE 8
+#endif
 
 static inline int better(uint32_t level_price, uint32_t price, char side)
 {
