@@ -3,6 +3,13 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+
+#ifdef SCAN_STATS
+void book_print_scan_stats(FILE *out);
+#else
+static inline void book_print_scan_stats(FILE *out) { (void)out; }
+#endif
 
 typedef struct {
     uint32_t shares;
@@ -14,6 +21,8 @@ typedef struct {
     level  *data;
     size_t  len;
     size_t  cap;
+    size_t max_seek_index;
+    size_t min_seek_index;
 } level_array;
 
 typedef struct {

@@ -479,6 +479,8 @@ static size_t print_report(const engine_t *e, const char *path,
                e->min_price / 10000.0, e->max_price / 10000.0);
     printf("  %-22s %llu\n", "orders >= $10,000", U64(e->high_price));
 
+    book_print_scan_stats(stdout);
+
     return failed;
 }
 
