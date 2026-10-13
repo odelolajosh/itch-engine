@@ -113,6 +113,12 @@ int order_table_grow(order_table *t)
     return 1;
 }
 
+void order_table_prefetch(order_table *t, uint64_t ref)
+{
+    size_t i = slot_for(ref, t->capacity);
+    __builtin_prefetch(&t->slots[i], 1, 3);
+}
+
 static inline size_t slot_for(uint64_t ref, size_t cap)
 {
     return modulo((size_t)((ref * 0x9E3779B97F4A7C15ULL) >> 32), cap);

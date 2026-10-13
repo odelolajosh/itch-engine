@@ -20,10 +20,11 @@ typedef struct
     size_t  count;
 } order_table;
 
-int    order_table_init(order_table *t, size_t capacity);
+int order_table_init(order_table *t, size_t capacity);
 order *order_table_insert(order_table *t, uint64_t ref);
 order *order_table_find(order_table *t, uint64_t ref);
-void   order_table_remove(order_table *t, uint64_t ref);
-void   order_table_free(order_table *t);
+void order_table_remove(order_table *t, uint64_t ref);
+void order_table_free(order_table *t);
+void order_table_prefetch(order_table *t, uint64_t ref);
 
 #endif

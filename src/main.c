@@ -24,6 +24,10 @@ static double now_sec(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+#ifndef PF_DIST
+#define PF_DIST 16          /* power of two: how many messages are queued ahead */
+#endif
+
 #define MAX_LOCATE (1 << 16)
 const uint64_t NS_PER_DAY = 86400ULL * 1000000000ULL;
 
@@ -46,44 +50,20 @@ typedef struct {
     uint64_t book_errors;
 } engine_t;
 
-int engine_init(engine_t *engine)
-{
-    *engine = (engine_t){0};
-    engine->min_price = UINT32_MAX;
+int engine_init(engine_t *engine);
+void engine_free(engine_t *engine);
 
-    engine->books = calloc(MAX_LOCATE, sizeof(book));
-    if (!engine->books)
-    {
-        fprintf(stderr, "unable to initialize books\n");
-        return 0;
-    }
+typedef struct {
+    const uint8_t *msg;
+    uint16_t len;
+} pending_message;
 
-    if (!order_table_init(&engine->orders, 1 << 20))
-    {
-        fprintf(stderr, "unable to initialize order table\n");
-        free(engine->books);
-        engine->books = NULL;
-        return 0;
-    }
-    return 1;
-}
+static int next_message(const uint8_t *base, size_t limit, size_t file_size, size_t *off, pending_message *out);
+static void prefetch_message(engine_t *e, const uint8_t *msg);
+static int handle_message(engine_t *e, pending_message p);
 
-void engine_free(engine_t *engine)
-{
-    if (engine->books) {
-        for (size_t i = 0; i < MAX_LOCATE; i++)
-            book_free(&engine->books[i]);
-        free(engine->books);
-        engine->books = NULL;
-    }
-    order_table_free(&engine->orders);
-}
-
-static void reduce_order(engine_t *engine, uint64_t order_ref,
-    uint32_t shares, int delete_all);
-
-static int add_order(engine_t *engine, uint16_t stock_locate,
-    uint64_t order_ref, char side, uint32_t price, uint32_t shares);
+static void reduce_order(engine_t *engine, uint64_t order_ref, uint32_t shares, int delete_all);
+static int add_order(engine_t *engine, uint16_t stock_locate, uint64_t order_ref, char side, uint32_t price, uint32_t shares);
 
 static size_t print_report(const engine_t *e, const char *path,
                            size_t off, size_t limit, size_t file_size, double elapsed);
@@ -156,167 +136,265 @@ int main(int argc, char **argv) {
 
     double t0 = now_sec();
     size_t off = 0;
-    while (off + 2 <= limit)
+    pending_message p;
+
+    pending_message ring[PF_DIST];
+    size_t head = 0, tail = 0;   /* head = next slot to fill, tail = next to process */
+
+    while (next_message(data, limit, file_size, &off, &p))
     {
-        uint16_t len = be16(data + off);
-        if (len == 0 || off + 2 + len > limit)
+        prefetch_message(&engine, p.msg);
+        ring[head++ & (PF_DIST - 1)] = p;
+
+        if (head - tail == PF_DIST) /* queue full: process the oldest */
         {
-            if (limit == file_size)
-                fprintf(stderr, "truncated or corrupt frame at offset %llu\n",
-                    (unsigned long long)off);
-            break;
+            status = handle_message(&engine, ring[tail++ & (PF_DIST - 1)]);
+            if (status != 0) goto cleanup;
         }
-        const uint8_t *msg = data + off + 2;
-        uint8_t type = msg[0];
+    }
 
-        if (ITCH_MSG_LEN[type] == 0)
-            engine.unknown++;
-        else if (ITCH_MSG_LEN[type] != len)
-            engine.bad_len++;
-
-        engine.counts[type]++;
-        engine.total++;
-
-        if (ITCH_MSG_LEN[type] == len)
-        {
-            itch_header h;
-            itch_decode_header(msg, &h);
-
-            if (h.timestamp_ns < engine.last_ts)
-                engine.ts_backwards++;
-            if (h.timestamp_ns >= NS_PER_DAY)
-                engine.ts_out_of_day++;
-
-            engine.last_ts = h.timestamp_ns;
-
-            switch (type)
-            {
-                case 'A':
-                case 'F':
-                {
-                    itch_add_order a;
-                    itch_decode_add_order(msg, &a);
-
-                    if (a.side != 'B' && a.side != 'S')
-                        engine.bad_side++;
-                    if (a.shares == 0)
-                        engine.zero_shares++;
-                    if (a.price == 0)
-                        engine.zero_price++;
-                    if (a.price < engine.min_price)
-                        engine.min_price = a.price;
-                    if (a.price > engine.max_price)
-                        engine.max_price = a.price;
-                    if (a.price >= 100000000) {
-                        engine.high_price++;
-                        if (engine.high_price <= 5)
-                            printf("high: %.8s  %c  %u shares @ $%.4f\n", a.stock, a.side,
-                            a.shares, a.price / 10000.0);
-                    }
-
-                    if (!add_order(&engine, a.hdr.stock_locate, a.order_ref,
-                        a.side, a.price, a.shares))
-                    {
-                        status = EXIT_FAILURE;
-                        goto cleanup;
-                    }
-
-                    break;
-                }
-                case 'E':
-                case 'C':
-                {
-                    itch_order_executed e;
-                    itch_decode_order_executed(msg, &e);
-
-                    if (e.executed_shares == 0)
-                        engine.zero_shares++;
-
-                    reduce_order(&engine, e.order_ref, e.executed_shares, 0);
-                    break;
-                }
-                case 'X':
-                {
-                    itch_order_cancel x;
-                    itch_decode_order_cancel(msg, &x);
-
-                    if (x.cancelled_shares == 0)
-                        engine.zero_shares++;
-
-                    reduce_order(&engine, x.order_ref, x.cancelled_shares, 0);
-                    break;
-                }
-                case 'D':
-                {
-                    itch_order_delete d;
-                    itch_decode_order_delete(msg, &d);
-                    reduce_order(&engine, d.order_ref, 0, 1);
-                    break;
-                }
-                case 'U':
-                {
-                    itch_order_replace u;
-                    itch_decode_order_replace(msg, &u);
-
-                    if (u.shares == 0)
-                        engine.zero_shares++;
-                    if (u.price == 0)
-                        engine.zero_price++;
-
-                    order *old = order_table_find(&engine.orders, u.original_order_ref);
-                    if (!old) { engine.unknown_order++; break; }
-
-                    uint16_t locate = old->stock_locate;
-                    char side = old->side;
-
-                    reduce_order(&engine, u.original_order_ref, 0, 1); // remove old order
-                    if (!add_order(&engine, locate, u.new_order_ref, side, u.price, u.shares))
-                    { // Out of memory
-                        status = EXIT_FAILURE;
-                        goto cleanup;
-                    }
-
-                    break;
-                }
-                case 'R':
-                {
-                    itch_stock_directory r;
-                    itch_decode_stock_directory(msg, &r);
-
-                    book *b = &engine.books[r.hdr.stock_locate];
-                    if (b->bids.data != NULL) { engine.dup_directory++; break; }
-
-                    if (!book_init(b))
-                    {
-                        fprintf(stderr, "out of memory initializing book %u\n",
-                        r.hdr.stock_locate);
-                        status = EXIT_FAILURE;
-                        goto cleanup;
-                    }
-                    memcpy(b->symbols, r.stock, 8);
-                    break;
-                }
-                default:
-                {
-                    break; /* other message types: not needed yet */
-                }
-            }
-        }
-
-        off += 2 + (size_t)len;
+    while (tail != head) { // process what is left the in queue
+        status = handle_message(&engine, ring[tail++ & (PF_DIST - 1)]);
+        if (status != 0)
+            goto cleanup;
     }
 
     double elapsed = now_sec() - t0;
 
-    if (print_report(&engine, argv[1], off, limit, file_size, elapsed) > 0)
+    if (print_report(&engine, path, off, limit, file_size, elapsed) > 0)
         status = EXIT_FAILURE;
 
     cleanup:
         engine_free(&engine);
-        munmap((void *)data, file_size);
+        munmap((void *)data, limit);
         close(fd);
         return status;
 }
+
+
+/* ------- Engine ------- */
+
+int engine_init(engine_t *engine)
+{
+    *engine = (engine_t){0};
+    engine->min_price = UINT32_MAX;
+
+    engine->books = calloc(MAX_LOCATE, sizeof(book));
+    if (!engine->books)
+    {
+        fprintf(stderr, "unable to initialize books\n");
+        return 0;
+    }
+
+    if (!order_table_init(&engine->orders, 1 << 20))
+    {
+        fprintf(stderr, "unable to initialize order table\n");
+        free(engine->books);
+        engine->books = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+void engine_free(engine_t *engine)
+{
+    if (engine->books) {
+        for (size_t i = 0; i < MAX_LOCATE; i++)
+            book_free(&engine->books[i]);
+        free(engine->books);
+        engine->books = NULL;
+    }
+    order_table_free(&engine->orders);
+}
+
+/* ------- Message ------- */
+
+static int next_message(const uint8_t *base, size_t limit, size_t file_size, size_t *off, pending_message *out)
+{
+    if (*off + 2 > limit)
+        return 0;
+
+    uint16_t len = be16(base + *off);
+    if (len == 0 || *off + 2 + len > limit)
+    {
+        if (limit == file_size)
+            fprintf(stderr, "truncated or corrupt frame at offset %llu\n",
+                (unsigned long long)*off);
+        return 0;
+    }
+
+    out->msg = base + *off + 2;
+    out->len = len;
+    *off += 2 + (size_t) len;
+    return 1;
+}
+
+static void prefetch_message(engine_t *e, const uint8_t *msg)
+{
+    switch (msg[0])
+    {
+        case 'A':
+        case 'F':
+        case 'D':
+        case 'E':
+        case 'C':
+        case 'X':
+        case 'U':
+        {
+            uint16_t locate = be16(msg + 1);
+            uint64_t ref = be64(msg + 11);
+            __builtin_prefetch(&e->books[locate], 1, 3);
+            order_table_prefetch(&e->orders, ref);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+/**
+ * Handles a single message
+ * Returns (exit) status: 0 for success, otherwise for errors
+ */
+static int handle_message(engine_t *engine, pending_message p)
+{
+    uint8_t type = p.msg[0];
+
+    if (ITCH_MSG_LEN[type] == 0)
+    {
+        engine->unknown++;
+        return 0;
+    }
+
+    if (ITCH_MSG_LEN[type] != p.len)
+    {
+        engine->bad_len++;
+        return 0;
+    }
+
+    engine->counts[type]++;
+    engine->total++;
+
+    itch_header h;
+    itch_decode_header(p.msg, &h);
+
+    if (h.timestamp_ns < engine->last_ts)
+        engine->ts_backwards++;
+    if (h.timestamp_ns >= NS_PER_DAY)
+        engine->ts_out_of_day++;
+
+    engine->last_ts = h.timestamp_ns;
+
+    switch (type)
+    {
+        case 'A':
+        case 'F':
+        {
+            itch_add_order a;
+            itch_decode_add_order(p.msg, &a);
+
+            if (a.side != 'B' && a.side != 'S')
+                engine->bad_side++;
+            if (a.shares == 0)
+                engine->zero_shares++;
+            if (a.price == 0)
+                engine->zero_price++;
+            if (a.price < engine->min_price)
+                engine->min_price = a.price;
+            if (a.price > engine->max_price)
+                engine->max_price = a.price;
+            if (a.price >= 100000000) {
+                engine->high_price++;
+                if (engine->high_price <= 5)
+                    printf("high: %.8s  %c  %u shares @ $%.4f\n", a.stock, a.side,
+                    a.shares, a.price / 10000.0);
+            }
+
+            if (!add_order(engine, a.hdr.stock_locate, a.order_ref,
+                a.side, a.price, a.shares))
+                return EXIT_FAILURE;
+
+            break;
+        }
+        case 'E':
+        case 'C':
+        {
+            itch_order_executed e;
+            itch_decode_order_executed(p.msg, &e);
+
+            if (e.executed_shares == 0)
+                engine->zero_shares++;
+
+            reduce_order(engine, e.order_ref, e.executed_shares, 0);
+            break;
+        }
+        case 'X':
+        {
+            itch_order_cancel x;
+            itch_decode_order_cancel(p.msg, &x);
+
+            if (x.cancelled_shares == 0)
+                engine->zero_shares++;
+
+            reduce_order(engine, x.order_ref, x.cancelled_shares, 0);
+            break;
+        }
+        case 'D':
+        {
+            itch_order_delete d;
+            itch_decode_order_delete(p.msg, &d);
+            reduce_order(engine, d.order_ref, 0, 1);
+            break;
+        }
+        case 'U':
+        {
+            itch_order_replace u;
+            itch_decode_order_replace(p.msg, &u);
+
+            if (u.shares == 0)
+                engine->zero_shares++;
+            if (u.price == 0)
+                engine->zero_price++;
+
+            order *old = order_table_find(&engine->orders, u.original_order_ref);
+            if (!old) { engine->unknown_order++; break; }
+
+            uint16_t locate = old->stock_locate;
+            char side = old->side;
+
+            reduce_order(engine, u.original_order_ref, 0, 1); // remove old order
+            if (!add_order(engine, locate, u.new_order_ref, side, u.price, u.shares))
+                return EXIT_FAILURE;
+
+            break;
+        }
+        case 'R':
+        {
+            itch_stock_directory r;
+            itch_decode_stock_directory(p.msg, &r);
+
+            book *b = &engine->books[r.hdr.stock_locate];
+            if (b->bids.data != NULL) { engine->dup_directory++; break; }
+
+            if (!book_init(b))
+            {
+                fprintf(stderr, "out of memory initializing book %u\n",
+                r.hdr.stock_locate);
+                return EXIT_FAILURE;
+            }
+            memcpy(b->symbols, r.stock, 8);
+            break;
+        }
+        default:
+        {
+            break; /* other message types: not needed yet */
+        }
+    }
+
+    return 0;
+}
+
+/* ------- Order ------- */
 
 static void reduce_order(engine_t *engine, uint64_t order_ref,
     uint32_t shares, int delete_all)
@@ -377,6 +455,8 @@ static int add_order(engine_t *engine, uint16_t stock_locate,
     book_add(b, side, price, shares);
     return 1;
 }
+
+/* ------- Report ------- */
 
 #define U64(x) ((unsigned long long)(x))
 
