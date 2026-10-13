@@ -245,6 +245,12 @@ static void prefetch_message(engine_t *e, const uint8_t *msg)
             uint64_t ref = be64(msg + 11);
             __builtin_prefetch(&e->books[locate], 1, 3);
             order_table_prefetch(&e->orders, ref);
+
+            if (msg[0] == 'U')
+            {
+                uint64_t new_ref = be64(msg + 19);
+                order_table_prefetch(&e->orders, new_ref);
+            }
             break;
         }
         default:
