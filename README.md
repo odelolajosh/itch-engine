@@ -2,8 +2,6 @@
 
 A high-performance Nasdaq TotalView-ITCH 5.0 feed handler and limit order book in C.
 
-> Status: M1 (parser) and M2 (order book) complete. M3 (performance) in progress.
-
 ## Getting the data
 
 Nasdaq publishes free sample ITCH 5.0 files (search "Nasdaq ITCH sample files").
@@ -114,8 +112,7 @@ the full day, and peaks at 1.78M live orders (vs 1.92M for the full day).
 Adding the order book made processing ~12× slower per message. The order table
 (4M slots × 24 bytes ≈ 100 MB) is much larger than the CPU caches, so most lookups
 likely go to main memory (~100 ns each). Since ~86% of messages are a hash insert
-or delete, this is consistent with the ~74 ns average. Milestone 3 will test this
-with a profiler.
+or delete, this is consistent with the ~74 ns average. Profiling in M3 confirmed this: the two memory-bound lookups accounted for 70% of runtime, and prefetching alone removed 23% of the time per message (see M3 below).
 
 ## M3: Performance
 
@@ -186,3 +183,55 @@ branches). The remaining ~20 ns per search goes to waiting for the level array i
 from main memory, which points to prefetching as the next optimization. The hybrid also caps
 worst-case search work at ≤31 comparisons instead of thousands, which matters for tail latency
 even though average throughput barely moves.
+
+### Software prefetching
+
+**Why:** the hybrid search showed that walking the level array was cheap; the cost was
+waiting on memory. Profiling put the two memory-bound lookups, `order_table_find` (38%)
+and `level_find` (32%), at 70% of runtime. Both start with a read from a pseudo-random
+location in a structure far larger than the CPU caches (order table ≈ 100 MB).
+
+**Change:** the whole input is memory-mapped, so future messages are visible before they
+are processed. The main loop keeps a small ring buffer of `PF_DIST` framed messages. When a
+message enters the ring, it issues `__builtin_prefetch` for its order-table slot and its
+book; it is processed `PF_DIST − 1` messages later, by which time that data has usually
+arrived. For Replace messages both the original and the new order reference are prefetched.
+Messages are still processed strictly in order: every variant produces a byte-identical
+report.
+
+**Timing** (A/B in one session, `perf stat -r 5`, CPU time; `PF_DIST=1` prefetches with no
+lookahead, equivalent to the previous loop):
+
+| PF_DIST        | task-clock       | ns/msg | vs. PF_DIST=1 |
+| -------------- | ---------------- | -----: | ------------: |
+| 1              | 10.88 s (avg of 2 runs) | 77.6 | —      |
+| 4              | 8.48 s ± 0.10%   | 60.5   | −22.0%        |
+| 8              | 8.38 s ± 0.12%   | 59.8   | **−23.0%**    |
+| 16             | 8.42 s ± 0.04%   | 60.1   | −22.6%        |
+| 32             | 8.42 s ± 0.31%   | 60.1   | −22.6%        |
+
+The gain plateaus from 4: at ~60–80 ns per message, a 3-message lead (~200 ns) already
+exceeds a ~100 ns memory access. `PF_DIST=8` was kept. The ring buffer itself costs nothing
+(`PF_DIST=1` matches the previous build).
+
+Re-profiling showed time in `order_table_find` falling from ≈4.9 s to ≈2.1 s (−57%), making
+`level_find` the largest hotspot (≈38%). (Absolute times are approximate: the two profiles
+come from different builds and sessions.)
+
+**What didn't work: prefetching the level arrays.** A two-stage pipeline read each
+message's book (and, for deletes and executions, its order-table entry) a few messages after
+stage 1, then prefetched the best-price end of the right level array:
+
+| Variant (vs. stage 1 only, same session, `perf stat -r 10`) | Change |
+| ----------------------------------------------------------- | -----: |
+| Stage 2, gap 2                                               | −0.5%  |
+| Stage 2, gap 6                                               | +0.3%  |
+| Stage 2, `PF_DIST=16`, gap 8                                 | −0.4%  |
+
+All within noise (the two baseline runs differed by 0.8%), including the longer queue that
+gave both stages ample time, so the timing of the pipeline was not the issue. Stage 2 was
+removed. The likely explanation, not yet verified: the best levels of active books are
+already in cache, and the remaining `level_find` cost comes from the ~23% of searches that
+go deep enough for the binary search, whose jumps land on different cache lines.
+Confirming this (`perf annotate`) and, if so, replacing the sorted arrays with a structure
+suited to deep searches is left as future work.
